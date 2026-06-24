@@ -141,9 +141,14 @@ void scheduler_warp_fn(
         }
 
         // Broadcast result to all lanes in warp (warp-uniform branch)
-        uint32_t task_type    = __shfl_sync(0xffffffff, task.type,    0);
-        uint64_t task_payload = __shfl_sync(0xffffffff,
-            reinterpret_cast<uint64_t&>(task.payload_idx), 0);
+        uint32_t task_type    = __shfl_sync(0xffffffff, task.type, 0);
+        // BUG FIX: __shfl_sync only operates on 32-bit (or float) values.
+        // Passing a uint64_t truncates silently to the low 32 bits, corrupting
+        // payload_idx for any index >= 2^32 (or miscompiling on most toolchains).
+        // Fix: split the 64-bit value into two 32-bit halves, shuffle each, recombine.
+        uint32_t payload_lo   = __shfl_sync(0xffffffff, (uint32_t)(task.payload_idx & 0xFFFFFFFFULL), 0);
+        uint32_t payload_hi   = __shfl_sync(0xffffffff, (uint32_t)(task.payload_idx >> 32),            0);
+        uint64_t task_payload = ((uint64_t)payload_hi << 32) | (uint64_t)payload_lo;
         got_task = __shfl_sync(0xffffffff, (int)got_task, 0);
 
         if (got_task) {
@@ -157,10 +162,15 @@ void scheduler_warp_fn(
             int block_sz   = 256;
             int grid_sz    = (n_elements + block_sz - 1) / block_sz;
 
-            // Dynamic Parallelism: launch child from device
-            // cudaStreamFireAndForget → non-blocking, no host sync required
+            // Dynamic Parallelism: launch child from device.
+            // BUG FIX: the original code called cudaStreamDestroy(child_stream)
+            // immediately after the launch, which is unsafe — the stream may
+            // still have the child kernel queued or running.  cudaStreamDestroy
+            // in CDP does NOT wait; it is only safe when the stream is idle.
+            // Fix: use cudaStreamFireAndForget so the runtime owns the stream
+            // lifetime and frees it automatically when the child finishes.
             cudaStream_t child_stream;
-            cudaStreamCreateWithFlags(&child_stream, cudaStreamNonBlocking);
+            cudaStreamCreateWithFlags(&child_stream, cudaStreamFireAndForget);
 
             switch (task_type) {
                 case TASK_COMPUTE:
@@ -182,9 +192,11 @@ void scheduler_warp_fn(
                         reinterpret_cast<TaskChainDescriptor*>(payload->input_ptr);
                     if (lane == 0) {
                         for (int i = 0; i < chain->next_count; ++i) {
-                            queue_enqueue(global_queue,
-                                          my_queue_offset,
-                                          &chain->next_tasks[i]);
+                            // BUG FIX: queue_enqueue does not exist; the correct
+                            // device-side function is queue_try_enqueue.
+                            queue_try_enqueue(global_queue,
+                                              my_queue_offset,
+                                              &chain->next_tasks[i]);
                         }
                     }
                     break;
@@ -197,8 +209,8 @@ void scheduler_warp_fn(
                     break;
             }
 
-            // Retire stream (device-side streams are cheap; CDP manages lifetime)
-            cudaStreamDestroy(child_stream);
+            // No explicit cudaStreamDestroy needed — cudaStreamFireAndForget
+            // streams are automatically reclaimed by the runtime when idle.
 
             // Mark task complete
             if (lane == 0)
