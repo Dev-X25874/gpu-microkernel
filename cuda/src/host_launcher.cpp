@@ -20,6 +20,7 @@
 #include <assert.h>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 // Forward declarations matching CUDA kernel signatures
 struct TaskQueue;
@@ -64,11 +65,24 @@ void verify_device_capabilities() {
         exit(EXIT_FAILURE);
     }
 
-    // Check CDP is actually enabled
+    // Check CDP (Dynamic Parallelism) is actually enabled
+    // BUG FIX: was cudaDevAttrCooperativeLaunch (cooperative grid sync),
+    // which is unrelated. The correct attribute for CDP is
+    // cudaDevAttrDynamicParallelismEnabled (introduced in CUDA 12.x).
+    // On older toolkits fall back to the compute-capability check already done above.
     int supports_cdp = 0;
+#if defined(cudaDevAttrDynamicParallelismEnabled)
     CUDA_CHECK(cudaDeviceGetAttribute(&supports_cdp,
-        cudaDevAttrCooperativeLaunch, device));
-    printf("  Cooperative launch: %s\n", supports_cdp ? "YES" : "NO");
+        cudaDevAttrDynamicParallelismEnabled, device));
+#else
+    // Pre-CUDA-12 toolkits: infer from SM version (>= 3.5 guarantees CDP)
+    supports_cdp = (prop.major > 3 || (prop.major == 3 && prop.minor >= 5)) ? 1 : 0;
+#endif
+    printf("  Dynamic Parallelism: %s\n", supports_cdp ? "YES" : "NO");
+    if (!supports_cdp) {
+        fprintf(stderr, "ERROR: Dynamic Parallelism not supported or not enabled.\n");
+        exit(EXIT_FAILURE);
+    }
 
     printf("\n");
 }
@@ -186,17 +200,28 @@ void microkernel_launch(MicrokernelContext* ctx) {
 void inject_tasks(MicrokernelContext* ctx,
                   const Task* tasks, int count,
                   TaskPayload* payloads) {
+    // BUG FIX: offsetof_payload_pool() was never defined; it would link-fail.
+    // SchedulerState layout: tasks_dispatched (8B) + tasks_enqueued (8B) +
+    //   flags (4B) + _pad[3] (12B) = 32 bytes before payload_pool[].
+    // We hard-code the offset to match the struct definition in scheduler.cuh.
+    static constexpr size_t PAYLOAD_POOL_OFFSET = 32;  // bytes
+
+    // BUG FIX: clamp count so we never overflow the pool
+    if (count > (int)PAYLOAD_POOL_SLOTS) {
+        fprintf(stderr, "[Host] WARNING: count %d exceeds pool size %zu; clamping.\n",
+                count, PAYLOAD_POOL_SLOTS);
+        count = (int)PAYLOAD_POOL_SLOTS;
+    }
+
     // Copy payloads into the device-side pool
     CUDA_CHECK(cudaMemcpyAsync(
-        // offset into sched_state->payload_pool
-        (uint8_t*)ctx->d_sched_state + offsetof_payload_pool(),
+        (uint8_t*)ctx->d_sched_state + PAYLOAD_POOL_OFFSET,
         payloads,
-        count * PAYLOAD_SIZE,
+        (size_t)count * PAYLOAD_SIZE,
         cudaMemcpyHostToDevice,
         ctx->kernel_stream));
 
     // Enqueue task descriptors (managed memory, no explicit copy needed)
-    // In production: use a lock-free ring from host side with UVM prefetching
     for (int i = 0; i < count; ++i) {
         uint32_t seg = i % 16;  // spread across segments
         bool ok = host_queue_enqueue(ctx->d_global_queue, seg, &tasks[i]);
@@ -226,9 +251,11 @@ struct HostMetrics {
 };
 
 HostMetrics collect_metrics(MicrokernelContext* ctx) {
-    // Async copy metrics from device
-    static uint8_t h_metrics_buf[108 * 64];
-    CUDA_CHECK(cudaMemcpyAsync(h_metrics_buf,
+    // BUG FIX: static uint8_t h_metrics_buf[108 * 64] hard-codes 108 SMs.
+    // On GPUs with more SMs (H100 has 132, future GPUs more) this overflows.
+    // Use a heap allocation sized to the actual SM count instead.
+    std::vector<uint8_t> h_metrics_buf(ctx->num_sms * METRIC_SLOT_SIZE);
+    CUDA_CHECK(cudaMemcpyAsync(h_metrics_buf.data(),
         ctx->d_metrics,
         ctx->num_sms * METRIC_SLOT_SIZE,
         cudaMemcpyDeviceToHost,
@@ -237,16 +264,19 @@ HostMetrics collect_metrics(MicrokernelContext* ctx) {
 
     HostMetrics result = {0, 0, 0, 0};
     for (int i = 0; i < ctx->num_sms; ++i) {
-        // Parse metric slot at known offsets
-        uint8_t* slot = h_metrics_buf + i * METRIC_SLOT_SIZE;
+        // Parse metric slot at known offsets matching MetricSlot in metrics.cuh:
+        //   offset  0 : tasks_completed  (unsigned long long, 8 bytes)
+        //   offset  8 : errors           (unsigned int,       4 bytes)
+        //   offset 12 : watchdog_resets  (unsigned int,       4 bytes)
+        uint8_t* slot = h_metrics_buf.data() + i * METRIC_SLOT_SIZE;
         unsigned long long completed;
         unsigned int errors, watchdog;
         memcpy(&completed, slot + 0,  8);
         memcpy(&errors,    slot + 8,  4);
         memcpy(&watchdog,  slot + 12, 4);
 
-        result.total_completed     += completed;
-        result.total_errors        += errors;
+        result.total_completed       += completed;
+        result.total_errors          += errors;
         result.total_watchdog_resets += watchdog;
         if (completed > 0) result.active_sms++;
     }
@@ -296,7 +326,6 @@ int main() {
     microkernel_launch(ctx);
 
     // 3. Inject initial workload
-    // In a real system, this could be driven by network I/O, sensor data, etc.
     const int N_TASKS = 1000;
     static Task tasks[N_TASKS];
     static TaskPayload payloads[N_TASKS];
@@ -309,7 +338,7 @@ int main() {
 
         payloads[i].element_count = 4096;
         payloads[i].iterations    = 16;
-        payloads[i].input_ptr     = 0;  // Would be real device pointer in production
+        payloads[i].input_ptr     = 0;
         payloads[i].output_ptr    = 0;
         payloads[i].flags         = 0;
     }
