@@ -1,10 +1,5 @@
 /**
  * benches/throughput_bench.cu — Microkernel Performance Benchmarks
- * =================================================================
- * Measures the three performance-critical numbers for the scheduler:
- *   1. Lock-free queue throughput (ops/sec)
- *   2. CDP child kernel launch latency (μs)
- *   3. End-to-end task latency (queue poll → child first instruction)
  *
  * Build: nvcc -arch=sm_80 -rdc=true -lcudadevrt throughput_bench.cu
  *             -I ../cuda/include -O3 --use_fast_math -o bench
@@ -16,12 +11,13 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <algorithm>
+#include <vector>
 #include "../cuda/include/task_queue.cuh"
 
 static constexpr int BENCH_ITERS      = 1000000;
 static constexpr int WARMUP_ITERS     = 10000;
 static constexpr int LATENCY_SAMPLES  = 10000;
-static constexpr int CDP_BENCH_BLOCKS = 108;  // one per SM on A100
+static constexpr int CDP_BENCH_BLOCKS = 108;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BENCHMARK 1: Queue Throughput
@@ -35,14 +31,12 @@ __global__ void queue_throughput_bench(TaskQueue* q, int iters) {
     Task t  = {TASK_COMPUTE, 0, (uint64_t)threadIdx.x, 0};
     Task out;
 
-    // Warmup
     for (int i = 0; i < WARMUP_ITERS / gridDim.x; ++i) {
         queue_try_enqueue(q, seg, &t);
         queue_try_dequeue(q, seg, &out);
     }
     __syncthreads();
 
-    // Timed region
     uint64_t start = clock64();
     int ops = 0;
 
@@ -61,9 +55,13 @@ __global__ void queue_throughput_bench(TaskQueue* q, int iters) {
 void run_queue_throughput_bench(TaskQueue* d_queue) {
     printf("── Benchmark 1: Queue Throughput ───────────────────────────\n");
 
-    // Reset
     cudaMemset(d_queue, 0, sizeof(TaskQueue));
-    g_queue_ops = 0;
+    // BUG FIX: g_queue_ops is a __device__ variable; assigning to it directly
+    // from host code is undefined behaviour. Use cudaMemcpyToSymbol instead.
+    {
+        unsigned long long zero = 0ULL;
+        cudaMemcpyToSymbol(g_queue_ops, &zero, sizeof(zero));
+    }
 
     int grid  = CDP_BENCH_BLOCKS;
     int block = 256;
@@ -93,7 +91,6 @@ void run_queue_throughput_bench(TaskQueue* d_queue) {
 // BENCHMARK 2: CDP Launch Latency
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Minimal child kernel — just records start time
 __global__ void cdp_noop_child(uint64_t* start_times, int slot) {
     if (threadIdx.x == 0) {
         start_times[slot] = clock64();
@@ -113,7 +110,7 @@ __global__ void cdp_launch_latency_bench(uint64_t* launch_times,
         cdp_noop_child<<<1, 32, 0, s>>>(start_times, i);
 
         cudaStreamDestroy(s);
-        cudaDeviceSynchronize();  // Wait for child to record its start time
+        cudaDeviceSynchronize();
     }
 }
 
@@ -132,10 +129,11 @@ void run_cdp_latency_bench() {
     cudaMemcpy(h_launch.data(), d_launch_times, LATENCY_SAMPLES * sizeof(uint64_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_start.data(),  d_start_times,  LATENCY_SAMPLES * sizeof(uint64_t), cudaMemcpyDeviceToHost);
 
-    // Get GPU clock rate (MHz) for cycle → μs conversion
-    int clock_mhz;
-    cudaDeviceGetAttribute(&clock_mhz, cudaDevAttrClockRate, 0);
-    clock_mhz /= 1000;  // kHz → MHz
+    // BUG FIX: store clock rate as double so division is floating-point,
+    // not integer — integer division silently truncates sub-μs latencies to 0.
+    int clock_khz_int;
+    cudaDeviceGetAttribute(&clock_khz_int, cudaDevAttrClockRate, 0);
+    double clock_mhz = (double)clock_khz_int / 1000.0;  // kHz → MHz
 
     std::vector<double> latencies_us(LATENCY_SAMPLES);
     for (int i = 0; i < LATENCY_SAMPLES; ++i) {
@@ -172,17 +170,14 @@ __global__ void e2e_child_kernel(int sample_idx) {
 __global__ void e2e_latency_bench(TaskQueue* q, int samples) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-    // Reset queue segment
     q->segments[0].head_packed.store(0, cuda::memory_order_relaxed);
     q->segments[0].tail_packed.store(0, cuda::memory_order_relaxed);
     for (int i = 0; i < SEGMENT_CAPACITY; ++i)
         q->segments[0].slot_state[i].store(SLOT_EMPTY, cuda::memory_order_relaxed);
 
     for (int i = 0; i < samples; ++i) {
-        // Record enqueue time
         g_e2e_enqueue_times[i] = clock64();
 
-        // Simulate task dispatch (what scheduler_warp_fn does)
         cudaStream_t s;
         cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
         e2e_child_kernel<<<1, 32, 0, s>>>(i);
@@ -201,13 +196,14 @@ void run_e2e_latency_bench(TaskQueue* d_queue) {
     cudaMemcpyFromSymbol(h_enq.data(),   g_e2e_enqueue_times, LATENCY_SAMPLES * sizeof(uint64_t));
     cudaMemcpyFromSymbol(h_child.data(), g_e2e_child_times,   LATENCY_SAMPLES * sizeof(uint64_t));
 
-    int clock_mhz;
-    cudaDeviceGetAttribute(&clock_mhz, cudaDevAttrClockRate, 0);
-    clock_mhz /= 1000;
+    // BUG FIX: same integer-division truncation fix as in run_cdp_latency_bench.
+    int clock_khz_int2;
+    cudaDeviceGetAttribute(&clock_khz_int2, cudaDevAttrClockRate, 0);
+    double clock_mhz_e2e = (double)clock_khz_int2 / 1000.0;
 
     std::vector<double> e2e_us(LATENCY_SAMPLES);
     for (int i = 0; i < LATENCY_SAMPLES; ++i)
-        e2e_us[i] = (double)(h_child[i] - h_enq[i]) / clock_mhz;
+        e2e_us[i] = (double)(h_child[i] - h_enq[i]) / clock_mhz_e2e;
     std::sort(e2e_us.begin(), e2e_us.end());
 
     printf("  P50:  %.1f μs\n", e2e_us[LATENCY_SAMPLES * 50 / 100]);
@@ -222,7 +218,6 @@ void run_e2e_latency_bench(TaskQueue* d_queue) {
 int main() {
     printf("=== GPU Microkernel Performance Benchmarks ===\n\n");
 
-    // Print device info
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
     printf("Device: %s (SM %d.%d, %d SMs, %.0f MHz)\n\n",
