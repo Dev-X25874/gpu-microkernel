@@ -1,13 +1,16 @@
 /**
  * scheduler.cuh — Scheduler State Structures
- * ============================================
  */
 
 #pragma once
 #include <cuda/atomic>
 #include "task_queue.cuh"
 
+// BUG FIX: MAX_SMs_CONST is now defined in task_queue.cuh (included above).
+// Guard against redefinition.
+#ifndef MAX_SMs_CONST
 static constexpr int MAX_SMs_CONST   = 108;
+#endif
 static constexpr int PAYLOAD_POOL_SZ = 65536;
 
 struct SchedulerState {
